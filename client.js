@@ -32,13 +32,18 @@ class SecureApiClient {
    * Initialize secure session with server (Maximum Security)
    * 1. Generate client ECDH key pair (for encryption)
    * 2. Generate client ECDSA key pair (for signing)
-   * 3. Get challenge from server
+   * 3. Get challenge from server (verify signature with pinned key)
    * 4. Sign challenge to prove identity
    * 5. Verify server's signature
    * 6. Establish encrypted session
    */
   async connect(clientId = 'my-app', userAgent = 'SecureClient/1.0') {
     console.log('🔑 Establishing maximum security session...');
+
+    // Step 0: Get and PIN server signing public key (prevents MITM on init)
+    const pubkeyResponse = await axios.get(`${this.baseUrl}/auth/pubkey`);
+    const pinnedServerSigningKey = pubkeyResponse.data.signingPublicKey;
+    console.log(`   📌 Pinned Server Key: ${pinnedServerSigningKey.substring(27, 60)}...`);
 
     // Generate ECDH keys (for encryption)
     this.clientEcdhKeys = generateKeyPair();
@@ -55,7 +60,25 @@ class SecureApiClient {
       clientId
     });
 
-    const { challenge, serverEcdhPublicKey, serverSigningPublicKey } = initResponse.data;
+    const { challenge, serverEcdhPublicKey, serverSigningPublicKey, initSignature, timestamp, keyId: initKeyId } = initResponse.data;
+    
+    // Step 1.5: Verify init response signature with PINNED key (anti-MITM)
+    const initDataToVerify = {
+      challenge,
+      keyId: initKeyId,
+      serverEcdhPublicKey,
+      serverSigningPublicKey,
+      timestamp
+    };
+    const initValid = verify(initDataToVerify, initSignature, pinnedServerSigningKey);
+    if (!initValid) {
+      throw new Error('Init signature verification failed - possible MITM attack!');
+    }
+    console.log('   ✅ Init response verified with pinned key (anti-MITM)');
+    
+    // Store verified server signing key
+    this.serverSigningPublicKey = serverSigningPublicKey;
+    
     console.log(`   Server ECDH Key: ${serverEcdhPublicKey.substring(0, 30)}...`);
     console.log(`   Challenge received: ${challenge.substring(0, 20)}...`);
 
@@ -73,7 +96,6 @@ class SecureApiClient {
     });
 
     const { sessionId, fingerprint, serverSignature, keyId } = sessionResponse.data;
-    this.serverSigningPublicKey = sessionResponse.data.serverSigningPublicKey;
 
     // Step 4: Verify server's signature (anti-MITM)
     const responseToVerify = {

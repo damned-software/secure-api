@@ -603,6 +603,13 @@
 
       // Connect to server
       async connect(clientId = 'web-client') {
+        // Step 0: Get and PIN server signing public key (prevents MITM on init)
+        log('Pinning server signing key...', 'crypto');
+        const pubkeyRes = await fetch(`${this.baseUrl}/auth/pubkey`);
+        const pubkeyData = await pubkeyRes.json();
+        const pinnedServerSigningKey = await this.importSigningPublicKey(pubkeyData.signingPublicKey);
+        log(`📌 Pinned Server Key: ${pubkeyData.signingPublicKey.substring(27, 60)}...`, 'success');
+        
         log('Generating ECDH key pair...', 'crypto');
         this.clientEcdhKeyPair = await this.generateEcdhKeyPair();
         const ecdhPubKey = await this.exportPublicKey(this.clientEcdhKeyPair.publicKey);
@@ -624,6 +631,21 @@
         });
         const initData = await initRes.json();
         log(`Challenge received: ${initData.challenge.substring(0, 20)}...`, 'response');
+        
+        // Step 1.5: Verify init response with PINNED key (anti-MITM)
+        log('Verifying init response with pinned key...', 'crypto');
+        const initDataToVerify = {
+          challenge: initData.challenge,
+          keyId: initData.keyId,
+          serverEcdhPublicKey: initData.serverEcdhPublicKey,
+          serverSigningPublicKey: initData.serverSigningPublicKey,
+          timestamp: initData.timestamp
+        };
+        const initValid = await this.verify(initDataToVerify, initData.initSignature, pinnedServerSigningKey);
+        if (!initValid) {
+          throw new Error('Init signature verification failed - possible MITM attack!');
+        }
+        log('Init response verified with pinned key ✓', 'success');
         
         // Step 2: Sign challenge
         log('Signing challenge...', 'crypto');

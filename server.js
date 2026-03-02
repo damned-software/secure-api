@@ -164,7 +164,7 @@ app.get('/auth/pubkey', (req, res) => {
   });
 });
 
-// Step 2: Initiate session with challenge
+// Step 2: Initiate session with challenge (SIGNED to prevent MITM)
 app.post('/auth/init', (req, res) => {
   const { clientEcdhPublicKey, clientSigningPublicKey, clientId } = req.body;
 
@@ -178,11 +178,21 @@ app.post('/auth/init', (req, res) => {
   // Generate challenge for client to sign
   const challenge = generateChallenge();
 
-  res.json({
+  // Build response data
+  const responseData = {
     challenge,
     keyId: serverKeys.keyId,
     serverEcdhPublicKey: serverKeys.ecdhKeys.publicKey,
-    serverSigningPublicKey: serverKeys.signingKeys.publicKey
+    serverSigningPublicKey: serverKeys.signingKeys.publicKey,
+    timestamp: Date.now()
+  };
+
+  // Sign the init response to prevent MITM from modifying serverEcdhPublicKey
+  const initSignature = sign(responseData, serverKeys.signingKeys.privateKey);
+
+  res.json({
+    ...responseData,
+    initSignature
   });
 });
 

@@ -73,6 +73,12 @@ export function deriveSharedSecret(privateKey, peerPublicKey) {
 
 **Algorithm:** `ECDSA` with `SHA-256`
 
+**ป้องกัน MITM 2 ระดับ:**
+| ระดับ | การป้องกัน | วิธีการ |
+|-------|------------|---------|
+| **Init Phase** | Signed `/auth/init` + Pinned Key | Client pin server signing key ก่อน แล้ว verify init response |
+| **API Phase** | Signed Request/Response | ทุก request และ response ถูก sign ด้วย ECDSA |
+
 **การทำงาน:**
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -448,10 +454,20 @@ derToRaw(derSig) {
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Complete Authentication Flow                         │
+│                   Complete Authentication Flow (MITM Protected)              │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 Client                                                              Server
+  │                                                                    │
+  │  GET /auth/pubkey                                                 │
+  │───────────────────────────────────────────────────────────────────►│
+  │◄───────────────────────────────────────────────────────────────────│
+  │  { signingPublicKey, ecdhPublicKey, keyId }                       │
+  │                                                                    │
+  │  ┌──────────────────────────────────┐                             │
+  │  │ 0. PIN Server Signing Key        │  ← ป้องกัน MITM on Init     │
+  │  │    pinnedKey = signingPublicKey  │                             │
+  │  └──────────────────────────────────┘                             │
   │                                                                    │
   │  ┌──────────────────────────────────┐                             │
   │  │ 1. Generate Keys                 │                             │
@@ -465,14 +481,20 @@ Client                                                              Server
   │                                                                    │
   │                                      ┌─────────────────────────┐  │
   │                                      │ Generate challenge      │  │
-  │                                      │ (32 bytes random)       │  │
+  │                                      │ Sign init response      │  │
   │                                      └─────────────────────────┘  │
   │                                                                    │
   │◄───────────────────────────────────────────────────────────────────│
-  │  { challenge, serverEcdhPublicKey, serverSigningPublicKey }       │
+  │  { challenge, serverEcdhPublicKey, initSignature, timestamp }     │
   │                                                                    │
   │  ┌──────────────────────────────────┐                             │
-  │  │ 2. Sign Challenge                │                             │
+  │  │ 2. Verify Init with PINNED Key   │  ← ป้องกัน MITM แก้ไข key    │
+  │  │    verify(initData, initSig,     │                             │
+  │  │           pinnedKey)             │                             │
+  │  └──────────────────────────────────┘                             │
+  │                                                                    │
+  │  ┌──────────────────────────────────┐                             │
+  │  │ 3. Sign Challenge                │                             │
   │  │    sig = sign(challenge, privKey)│                             │
   │  └──────────────────────────────────┘                             │
   │                                                                    │
@@ -481,24 +503,37 @@ Client                                                              Server
   │───────────────────────────────────────────────────────────────────►│
   │                                                                    │
   │                                      ┌─────────────────────────┐  │
-  │                                      │ 3. Verify Challenge     │  │
-  │                                      │ 4. Derive Shared Secret │  │
-  │                                      │ 5. Create Session       │  │
-  │                                      │ 6. Generate Fingerprint │  │
-  │                                      │ 7. Sign Response        │  │
+  │                                      │ 4. Verify Challenge     │  │
+  │                                      │ 5. Derive Shared Secret │  │
+  │                                      │ 6. Create Session       │  │
+  │                                      │ 7. Generate Fingerprint │  │
+  │                                      │ 8. Sign Response        │  │
   │                                      └─────────────────────────┘  │
   │                                                                    │
   │◄───────────────────────────────────────────────────────────────────│
   │  { sessionId, fingerprint, serverSignature }                      │
   │                                                                    │
   │  ┌──────────────────────────────────┐                             │
-  │  │ 8. Verify Server Signature       │                             │
-  │  │ 9. Derive Shared Secret          │                             │
-  │  │ 10. Store Session Info           │                             │
+  │  │ 9. Verify Server Signature       │                             │
+  │  │ 10. Derive Shared Secret         │                             │
+  │  │ 11. Store Session Info           │                             │
   │  └──────────────────────────────────┘                             │
   │                                                                    │
   │                    ✅ Secure Session Established                   │
   │════════════════════════════════════════════════════════════════════│
+```
+
+**MITM Protection on Init:**
+```javascript
+// Client pins server signing key FIRST
+const pubkeyResponse = await axios.get('/auth/pubkey');
+const pinnedServerSigningKey = pubkeyResponse.data.signingPublicKey;
+
+// Later, verify /auth/init response with pinned key
+const initValid = verify(initDataToVerify, initSignature, pinnedServerSigningKey);
+if (!initValid) {
+  throw new Error('Init signature verification failed - possible MITM attack!');
+}
 ```
 
 ---
@@ -717,7 +752,8 @@ node client.js
 |-------------|-------------------|--------|
 | **Eavesdropping** | AES-256-GCM Encryption | ✅ Protected |
 | **Data Tampering** | Authentication Tag (GCM) | ✅ Protected |
-| **MITM Attack** | ECDSA Digital Signatures | ✅ Protected |
+| **MITM Attack (API)** | ECDSA Digital Signatures | ✅ Protected |
+| **MITM Attack (Init)** | Signed Init + Pinned Key | ✅ Protected |
 | **Replay Attack** | Nonce + Timestamp + Sequence | ✅ Protected |
 | **Fake Client** | Challenge-Response Auth | ✅ Protected |
 | **Session Hijacking** | Fingerprint Binding | ✅ Protected |
