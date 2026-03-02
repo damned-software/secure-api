@@ -346,3 +346,101 @@ export class SecureMessageBuilder {
     return this.sequence;
   }
 }
+
+// ==========================================
+// KEY ROTATION MANAGER
+// ==========================================
+
+export class KeyRotationManager {
+  constructor(rotationIntervalMs = 24 * 60 * 60 * 1000) { // Default: 24 hours
+    this.keys = new Map(); // keyId -> { ecdhKeys, signingKeys, createdAt }
+    this.currentKeyId = null;
+    this.rotationInterval = rotationIntervalMs;
+    this.gracePeriod = rotationIntervalMs * 2; // Keep old keys for 2 rotation periods
+    
+    // Create initial keys
+    this.rotate();
+    
+    // Auto-rotate
+    this.rotationTimer = setInterval(() => this.rotate(), rotationIntervalMs);
+  }
+
+  rotate() {
+    const keyId = crypto.randomUUID();
+    const ecdhKeys = generateKeyPair();
+    const signingKeys = generateSigningKeyPair();
+    
+    this.keys.set(keyId, {
+      ecdhKeys,
+      signingKeys,
+      createdAt: Date.now()
+    });
+    
+    const previousKeyId = this.currentKeyId;
+    this.currentKeyId = keyId;
+    
+    console.log(`🔄 Key rotated: ${keyId.substring(0, 8)}...`);
+    if (previousKeyId) {
+      console.log(`   Previous key ${previousKeyId.substring(0, 8)}... still valid for grace period`);
+    }
+    
+    // Cleanup old keys
+    this.cleanup();
+    
+    return keyId;
+  }
+
+  getCurrentKeyId() {
+    return this.currentKeyId;
+  }
+
+  getCurrentKeys() {
+    return this.keys.get(this.currentKeyId);
+  }
+
+  getKeys(keyId) {
+    return this.keys.get(keyId);
+  }
+
+  isValidKeyId(keyId) {
+    return this.keys.has(keyId);
+  }
+
+  cleanup() {
+    const cutoff = Date.now() - this.gracePeriod;
+    for (const [id, key] of this.keys) {
+      if (key.createdAt < cutoff && id !== this.currentKeyId) {
+        this.keys.delete(id);
+        console.log(`🗑️  Old key retired: ${id.substring(0, 8)}...`);
+      }
+    }
+  }
+
+  // Get info for debugging/admin
+  getStatus() {
+    return {
+      currentKeyId: this.currentKeyId,
+      totalKeys: this.keys.size,
+      keys: Array.from(this.keys.entries()).map(([id, k]) => ({
+        keyId: id,
+        isCurrent: id === this.currentKeyId,
+        createdAt: new Date(k.createdAt).toISOString(),
+        expiresAt: new Date(k.createdAt + this.gracePeriod).toISOString()
+      }))
+    };
+  }
+
+  // Manual rotation trigger
+  forceRotate() {
+    console.log('⚠️  Force key rotation triggered');
+    return this.rotate();
+  }
+
+  // Stop auto-rotation
+  stop() {
+    if (this.rotationTimer) {
+      clearInterval(this.rotationTimer);
+      this.rotationTimer = null;
+    }
+  }
+}

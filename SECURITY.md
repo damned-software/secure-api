@@ -308,6 +308,142 @@ if (session.fingerprint !== clientFingerprint) {
 
 ---
 
+### 7. 🔑 Key Rotation
+
+**วัตถุประสงค์:** จำกัดความเสียหายหาก key รั่วไหล และเพิ่มความปลอดภัยระยะยาว
+
+**คุณสมบัติ:**
+- หมุน Key อัตโนมัติตามระยะเวลาที่กำหนด
+- Grace Period ให้ sessions ที่ใช้ key เก่ายังคงใช้งานได้
+- Active Sessions จะถูก update ให้ใช้ key ใหม่
+- Admin API สำหรับดู keys และ manual rotate
+
+**KeyRotationManager Class:**
+```javascript
+export class KeyRotationManager {
+  constructor(options = {}) {
+    this.rotationInterval = options.rotationInterval || 24 * 60 * 60 * 1000; // 24 hours
+    this.gracePeriod = options.gracePeriod || 2 * this.rotationInterval;
+    this.keys = new Map();        // keyId -> keyData
+    this.currentKeyId = null;
+    
+    this.rotateKeys();  // Generate initial keys
+    
+    // Auto-rotate
+    if (options.autoRotate !== false) {
+      this.rotationTimer = setInterval(
+        () => this.rotateKeys(),
+        this.rotationInterval
+      );
+    }
+  }
+
+  rotateKeys() {
+    // Generate new ECDH and ECDSA key pairs
+    const ecdhKeys = generateKeyPair();
+    const signingKeys = generateSigningKeyPair();
+    const keyId = crypto.randomBytes(8).toString('hex');
+
+    this.keys.set(keyId, {
+      ecdh: ecdhKeys,
+      signing: signingKeys,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + this.rotationInterval + this.gracePeriod
+    });
+
+    this.currentKeyId = keyId;
+    this.cleanupExpiredKeys();
+
+    return keyId;
+  }
+
+  getCurrentKeys() {
+    return {
+      keyId: this.currentKeyId,
+      ...this.keys.get(this.currentKeyId)
+    };
+  }
+}
+```
+
+**Admin Endpoints:**
+```
+GET /admin/keys   - ดูสถานะ keys ทั้งหมด
+POST /admin/rotate - Manual rotate keys
+```
+
+**การทำงาน:**
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    Key Rotation Timeline                       │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  ┌─────────┐    ┌─────────┐    ┌─────────┐                    │
+│  │  Key A  │────│  Key B  │────│  Key C  │───► ...             │
+│  │ Active  │    │ Active  │    │ Active  │                    │
+│  └────┬────┘    └────┬────┘    └────┬────┘                    │
+│       │              │              │                          │
+│  ├────┴────────────►│              │  (Key A grace period)    │
+│       │         ├────┴────────────►│  (Key B grace period)    │
+│       │              │              │                          │
+│  ▼────────────▼──────────────▼─────────────▼                  │
+│  0h          24h           48h           72h                   │
+│                                                                │
+│  Sessions created with Key A can still work during grace      │
+│  period even after Key B becomes active                       │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 8. 🌐 Web Client (Browser Inspector)
+
+**วัตถุประสงค์:** ให้สามารถ inspect encrypted requests ผ่าน DevTools ของ browser
+
+**คุณสมบัติ:**
+- ใช้ Web Crypto API สำหรับ cryptography ใน browser
+- แสดง Request/Response ทั้งแบบ Encrypted และ Decrypted
+- ECDSA Signature Format Conversion (Raw ↔ DER)
+- Activity Log แสดงการทำงานแบบ real-time
+
+**ECDSA Signature Format Conversion:**
+
+Web Crypto API ใช้ format แบบ Raw (r||s - 64 bytes) แต่ Node.js ใช้ DER format
+
+```javascript
+// Convert Raw (64 bytes: r||s) to DER format
+rawToDer(rawSig) {
+  const bytes = new Uint8Array(rawSig);
+  const r = bytes.slice(0, 32);
+  const s = bytes.slice(32, 64);
+
+  // Build DER structure: SEQUENCE { INTEGER r, INTEGER s }
+  // ... (encode as ASN.1 DER)
+  
+  return derBuffer;
+}
+
+// Convert DER to Raw for verification
+derToRaw(derSig) {
+  // Parse DER and extract r, s values
+  // ... (decode ASN.1 DER)
+  
+  return rawBuffer; // 64 bytes: r || s
+}
+```
+
+**Features:**
+- 🔌 Connect/Disconnect จาก secure session
+- 👤 Profile, 📦 Orders, 💸 Transfer, 🔒 Secrets buttons
+- 🔍 Request Inspector (Encrypted/Decrypted tabs)
+- 📥 Response Inspector (Encrypted/Decrypted tabs)
+- 📋 Activity Log
+
+**URL:** `http://localhost:3001/`
+
+---
+
 ## Authentication Flow
 
 ```
@@ -487,6 +623,10 @@ export const CONFIG = {
   // Session settings
   sessionTTL: 3600000,        // 1 hour
   
+  // Key rotation settings
+  keyRotationInterval: 24 * 60 * 60 * 1000,  // 24 hours (demo: 1 min)
+  keyGracePeriod: 2 * keyRotationInterval,    // 48 hours grace period
+  
   // Server
   port: 3001,
   baseUrl: 'http://localhost:3001'
@@ -499,11 +639,14 @@ export const CONFIG = {
 
 ```
 secure-api/
-├── crypto.js      # Security functions & classes
-├── server.js      # Express server with security middleware
-├── client.js      # Secure API client with tests
-├── package.json   # Dependencies
-└── SECURITY.md    # This documentation
+├── crypto.js          # Security functions & KeyRotationManager
+├── server.js          # Express server with security middleware
+├── client.js          # Node.js secure client with tests
+├── package.json       # Dependencies
+├── SECURITY.md        # This documentation
+├── .gitignore         # Git ignore rules
+└── public/
+    └── index.html     # Web client for browser inspection
 ```
 
 ---
@@ -515,7 +658,8 @@ secure-api/
   "dependencies": {
     "express": "^4.x",
     "axios": "^1.x",
-    "uuid": "^9.x"
+    "uuid": "^9.x",
+    "cors": "^2.x"
   }
 }
 ```
@@ -558,6 +702,13 @@ node client.js
 | POST | `/api/transfer` | Transfer money |
 | POST | `/api/secrets` | Get sensitive data |
 
+### Admin Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/admin/keys` | View all key statuses |
+| POST | `/admin/rotate` | Manual key rotation |
+
 ---
 
 ## Security Summary
@@ -571,6 +722,7 @@ node client.js
 | **Fake Client** | Challenge-Response Auth | ✅ Protected |
 | **Session Hijacking** | Fingerprint Binding | ✅ Protected |
 | **Key Compromise** | Perfect Forward Secrecy (ECDH) | ✅ Protected |
+| **Long-term Key Exposure** | Key Rotation (Auto + Manual) | ✅ Protected |
 | **Session Expiry** | TTL + Auto Cleanup | ✅ Protected |
 
 ---

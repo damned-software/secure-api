@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 import express from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import {
   generateKeyPair,
   generateSigningKeyPair,
@@ -12,21 +14,34 @@ import {
   generateClientFingerprint,
   NonceValidator,
   SecureSessionManager,
+  KeyRotationManager,
   CONFIG
 } from './crypto.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
 
+// Serve static files for web client
+app.use(express.static(path.join(__dirname, 'public')));
+
+// CORS for browser
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-Client-Fingerprint');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 // ==========================================
-// SERVER STATE (Maximum Security)
+// SERVER STATE (Maximum Security + Key Rotation)
 // ==========================================
 
-// ECDH keys for encryption
-const serverKeys = generateKeyPair();
-
-// ECDSA keys for signing (anti-MITM)
-const serverSigningKeys = generateSigningKeyPair();
+// Key Rotation Manager - rotates every 1 minute for demo (use 24h in production)
+const keyManager = new KeyRotationManager(60 * 1000); // 1 minute for demo
 
 // Secure session manager with auto-expiry
 const sessionManager = new SecureSessionManager();
@@ -34,8 +49,31 @@ const sessionManager = new SecureSessionManager();
 // Enhanced nonce validator with sequence tracking
 const nonceValidator = new NonceValidator();
 
-console.log('🔐 Server ECDH Public Key:', serverKeys.publicKey.substring(0, 40) + '...');
-console.log('🔏 Server Signing Public Key:', serverSigningKeys.publicKey.substring(0, 50) + '...');
+// Helper to get current server keys
+function getServerKeys() {
+  const keys = keyManager.getCurrentKeys();
+  return {
+    keyId: keyManager.getCurrentKeyId(),
+    ecdhKeys: keys.ecdhKeys,
+    signingKeys: keys.signingKeys
+  };
+}
+
+// Helper to get keys by ID (for existing sessions)
+function getServerKeysBySession(session) {
+  const keys = keyManager.getKeys(session.serverKeyId);
+  if (!keys) {
+    // Key expired, need to re-auth
+    return null;
+  }
+  return {
+    keyId: session.serverKeyId,
+    ecdhKeys: keys.ecdhKeys,
+    signingKeys: keys.signingKeys
+  };
+}
+
+console.log('🔐 Initial Key ID:', keyManager.getCurrentKeyId().substring(0, 8) + '...');
 
 // ==========================================
 // MIDDLEWARE: Maximum Security Validation
@@ -58,15 +96,22 @@ function secureEndpoint(req, res, next) {
     return res.status(403).json({ error: 'Session binding failed - fingerprint mismatch' });
   }
 
+  // 3. Get server keys for this session (key rotation support)
+  const serverKeys = getServerKeysBySession(session);
+  if (!serverKeys) {
+    console.log('⚠️  Server key expired - client needs to re-authenticate');
+    return res.status(401).json({ error: 'Server key rotated - please re-authenticate' });
+  }
+
   try {
-    // 3. Verify signature & decrypt (anti-MITM)
+    // 4. Verify signature & decrypt (anti-MITM)
     const { payload, nonce, timestamp, sequence } = verifyAndDecrypt(
       req.body,
       session.sharedSecret,
       session.clientSigningPublicKey
     );
 
-    // 4. Validate against replay attack (nonce + timestamp + sequence)
+    // 5. Validate against replay attack (nonce + timestamp + sequence)
     const validation = nonceValidator.validate(nonce, timestamp, sessionId, sequence);
     if (!validation.valid) {
       console.log(`⚠️  Blocked: ${validation.error}`);
@@ -77,6 +122,7 @@ function secureEndpoint(req, res, next) {
     req.secureBody = payload;
     req.session = session;
     req.sessionId = sessionId;
+    req.serverKeys = serverKeys;
 
     // Override res.json to auto-encrypt & sign responses
     const originalJson = res.json.bind(res);
@@ -86,7 +132,7 @@ function secureEndpoint(req, res, next) {
       const encrypted = encryptAndSign(
         data,
         session.sharedSecret,
-        serverSigningKeys.privateKey,
+        serverKeys.signingKeys.privateKey,
         session.responseSequence
       );
       return originalJson(encrypted);
@@ -110,9 +156,11 @@ function secureEndpoint(req, res, next) {
 
 // Step 1: Get server's public keys (ECDH + Signing)
 app.get('/auth/pubkey', (req, res) => {
+  const serverKeys = getServerKeys();
   res.json({
-    ecdhPublicKey: serverKeys.publicKey,
-    signingPublicKey: serverSigningKeys.publicKey
+    keyId: serverKeys.keyId,
+    ecdhPublicKey: serverKeys.ecdhKeys.publicKey,
+    signingPublicKey: serverKeys.signingKeys.publicKey
   });
 });
 
@@ -124,13 +172,17 @@ app.post('/auth/init', (req, res) => {
     return res.status(400).json({ error: 'Missing client public keys' });
   }
 
+  // Get current server keys
+  const serverKeys = getServerKeys();
+
   // Generate challenge for client to sign
   const challenge = generateChallenge();
 
   res.json({
     challenge,
-    serverEcdhPublicKey: serverKeys.publicKey,
-    serverSigningPublicKey: serverSigningKeys.publicKey
+    keyId: serverKeys.keyId,
+    serverEcdhPublicKey: serverKeys.ecdhKeys.publicKey,
+    serverSigningPublicKey: serverKeys.signingKeys.publicKey
   });
 });
 
@@ -154,6 +206,9 @@ app.post('/auth/session', (req, res) => {
   }
 
   try {
+    // Get current server keys
+    const serverKeys = getServerKeys();
+
     // Verify client signed the challenge (proves client has private key)
     const isValid = verify(challenge, challengeSignature, clientSigningPublicKey);
     if (!isValid) {
@@ -162,7 +217,7 @@ app.post('/auth/session', (req, res) => {
     }
 
     // Derive shared secret for encryption
-    const sharedSecret = deriveSharedSecret(serverKeys.privateKey, clientEcdhPublicKey);
+    const sharedSecret = deriveSharedSecret(serverKeys.ecdhKeys.privateKey, clientEcdhPublicKey);
 
     // Generate session ID and fingerprint
     const sessionId = crypto.randomUUID();
@@ -172,7 +227,7 @@ app.post('/auth/session', (req, res) => {
       userAgent
     );
 
-    // Create secure session
+    // Create secure session with server key ID for rotation support
     sessionManager.create(sessionId, {
       sharedSecret,
       clientId: clientId || 'anonymous',
@@ -180,6 +235,7 @@ app.post('/auth/session', (req, res) => {
       clientEcdhPublicKey,
       fingerprint,
       userAgent,
+      serverKeyId: serverKeys.keyId, // Store which server key was used
       responseSequence: 0
     });
 
@@ -187,19 +243,21 @@ app.post('/auth/session', (req, res) => {
     const responseData = {
       sessionId,
       fingerprint,
-      serverEcdhPublicKey: serverKeys.publicKey,
+      keyId: serverKeys.keyId,
+      serverEcdhPublicKey: serverKeys.ecdhKeys.publicKey,
       expiresIn: CONFIG.sessionTTL / 1000
     };
     
-    const serverSignature = sign(responseData, serverSigningKeys.privateKey);
+    const serverSignature = sign(responseData, serverKeys.signingKeys.privateKey);
 
     console.log(`✅ Secure session: ${sessionId} for ${clientId || 'anonymous'}`);
+    console.log(`   Key ID: ${serverKeys.keyId.substring(0, 8)}...`);
     console.log(`   Fingerprint: ${fingerprint.substring(0, 32)}...`);
 
     res.json({
       ...responseData,
       serverSignature,
-      serverSigningPublicKey: serverSigningKeys.publicKey
+      serverSigningPublicKey: serverKeys.signingKeys.publicKey
     });
   } catch (err) {
     console.error('Session creation failed:', err.message);
@@ -285,6 +343,21 @@ app.get('/admin/sessions', (req, res) => {
   res.json(sessionManager.list());
 });
 
+// Key rotation status
+app.get('/admin/keys', (req, res) => {
+  res.json(keyManager.getStatus());
+});
+
+// Force key rotation (for testing)
+app.post('/admin/rotate', (req, res) => {
+  const newKeyId = keyManager.forceRotate();
+  res.json({ 
+    success: true, 
+    newKeyId,
+    message: 'Keys rotated. Existing sessions will continue to work during grace period.'
+  });
+});
+
 // ==========================================
 // START
 // ==========================================
@@ -300,9 +373,11 @@ app.listen(CONFIG.port, () => {
   console.log('║  🛡️  Challenge-Response Auth (Anti-Fake-Client)            ║');
   console.log('║  🔄 Nonce + Timestamp + Sequence (Anti-Replay)             ║');
   console.log('║  📍 Session Binding (Anti-Hijacking)                       ║');
+  console.log('║  🔑 Auto Key Rotation (every 1 minute for demo)            ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log('');
   console.log(`🚀 Running on ${CONFIG.baseUrl}`);
+  console.log(`🌐 Web Client: ${CONFIG.baseUrl}/`);
   console.log('');
   console.log('📋 Auth Endpoints:');
   console.log('   GET  /auth/pubkey    - Get server public keys');
@@ -315,5 +390,10 @@ app.listen(CONFIG.port, () => {
   console.log('   POST /api/orders     - Submit order');
   console.log('   POST /api/transfer   - Transfer money');
   console.log('   POST /api/secrets    - Get sensitive data');
+  console.log('');
+  console.log('🔧 Admin Endpoints:');
+  console.log('   GET  /admin/sessions - List active sessions');
+  console.log('   GET  /admin/keys     - Key rotation status');
+  console.log('   POST /admin/rotate   - Force key rotation');
   console.log('');
 });

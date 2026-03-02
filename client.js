@@ -72,13 +72,14 @@ class SecureApiClient {
       userAgent
     });
 
-    const { sessionId, fingerprint, serverSignature } = sessionResponse.data;
+    const { sessionId, fingerprint, serverSignature, keyId } = sessionResponse.data;
     this.serverSigningPublicKey = sessionResponse.data.serverSigningPublicKey;
 
     // Step 4: Verify server's signature (anti-MITM)
     const responseToVerify = {
       sessionId,
       fingerprint,
+      keyId,
       serverEcdhPublicKey: sessionResponse.data.serverEcdhPublicKey,
       expiresIn: sessionResponse.data.expiresIn
     };
@@ -88,6 +89,7 @@ class SecureApiClient {
       throw new Error('Server signature verification failed - possible MITM attack!');
     }
     console.log('   ✅ Server signature verified (anti-MITM)');
+    console.log(`   Key ID: ${keyId.substring(0, 8)}...`);
 
     // Step 5: Derive shared secret
     this.sharedSecret = deriveSharedSecret(this.clientEcdhKeys.privateKey, serverEcdhPublicKey);
